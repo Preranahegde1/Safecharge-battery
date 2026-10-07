@@ -7,6 +7,7 @@ Every year, thousands of mobile devices catch fire or suffer permanent damage du
 The core problem is that conventional battery management relies on software OS routines. If an OS freezes, delays, or suffers a kernel panic, battery monitoring halts while charging power remains connected!
 
 To solve this, we created SAFECHARGE—a low-cost, dual-stage hardware-level safety controller. It continuously samples Voltage, Current, and Temperature at high resolution, streams telemetry to a PYNQ-Z2 FPGA hardware state machine, and physically trips a relay cutoff in under 100 milliseconds before thermal runaway can even start. Let us show you our live working demonstration!"
+
 Stage 1 (ESP32 Sensing & Local Display):
 
 Uses ADC1 channels to sample physical transducers (
@@ -47,10 +48,12 @@ T<32
 ∘
 C)."
 What to point at:
+
 Show the Green LED illuminated on the board.
 Point out the Relay closed supplying power to the load.
 Show the 16×2 LCD reading STATE: SAFE.
 Point to your laptop screen showing Green progress bars and live telemetry lines on the PYNQ Jupyter Dashboard.
+
 Step 2: Demonstrate Temperature Warning Threshold
 Action: Turn POT 3 (Temperature Knob) slowly clockwise.
 What to say: "Now, as temperature rises above 
@@ -81,13 +84,18 @@ C
 40.0
 ∘
 C, the FPGA hardware FSM trips an instantaneous Hard Cutoff!"
+
 What to point at:
+
 Relay clicks OFF instantly (<100ms), physically disconnecting load power.
 Red LED illuminates and Buzzer sounds the audible alarm.
 Dashboard displays RED bars, latches FAULT state, and logs the exact event State: FAULT.
+
 Step 4: Demonstrate Fault Latch & Reset Protocol
 Action: Turn the knob back down to a normal value.
+
 What to say: "Notice that even though I turned the temperature knob back down, the system remains latched in FAULT state for safety—it will never automatically re-energize a dangerous battery. It requires an explicit human reset."
+
 Action: Press the physical RESET Push Button.
 What to say: "Pressing the RESET button verifies parameters are safe and restores the system to MONITOR (SAFE) charging mode!"
 Hardware-Level Determinism:
