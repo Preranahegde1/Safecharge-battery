@@ -1,0 +1,147 @@
+module fpga_safety_led (
+    input  wire clk,
+    input  wire uart_rx,
+    output wire led,
+    output wire relay_cutoff,
+    output wire warning_status,
+    output wire fault_status
+);
+
+    localparam integer BAUD_DIV = 1085;
+    localparam integer MAX_VOLTAGE = 5500;  // 5.5 V
+    localparam integer MAX_CURRENT = 7500;  // 7.5 A
+    localparam integer MAX_TEMP    = 4000;  // 40.0 C
+
+    localparam integer WARN_VOLTAGE = 5000; // 5.0 V
+    localparam integer WARN_CURRENT = 6500; // 6.5 A
+    localparam integer WARN_TEMP    = 3200; // 32.0 C
+
+    reg rx_sync1 = 1'b1, rx_sync2 = 1'b1;
+    always @(posedge clk) begin
+        rx_sync1 <= uart_rx;
+        rx_sync2 <= rx_sync1;
+    end
+
+    localparam IDLE = 2'd0, START = 2'd1, DATA = 2'd2, STOP = 2'd3;
+    reg [1:0] state = IDLE;
+    reg [12:0] baud_counter = 0;
+    reg [2:0]  bit_count = 0;
+    reg [7:0]  rx_shift = 0;
+
+    localparam FIELD_NONE = 3'd0, FIELD_V = 3'd1, FIELD_I = 3'd2, FIELD_T = 3'd3, FIELD_F = 3'd4, FIELD_S = 3'd5;
+    reg [2:0] current_field = FIELD_NONE;
+    reg [31:0] number_value = 0;
+    reg reading_number = 1'b0;
+
+    reg [31:0] voltage_value = 0, current_value = 0, temperature_value = 0;
+    reg [31:0] previous_voltage = 0, previous_current = 0, previous_temperature = 0;
+    reg voltage_initialized = 1'b0, current_initialized = 1'b0, temperature_initialized = 1'b0;
+    reg voltage_spike = 1'b0, current_surge = 1'b0, rapid_temperature_rise = 1'b0;
+    reg [63:0] power_uW = 0;
+    reg esp_fault = 1'b0, sensor_ok = 1'b1, data_received = 1'b0;
+
+    localparam integer VOLTAGE_SPIKE_LIMIT = 500;
+    localparam integer CURRENT_SURGE_LIMIT = 1000;
+
+    wire dangerous_voltage     = (voltage_value > MAX_VOLTAGE);
+    wire dangerous_current     = (current_value > MAX_CURRENT);
+    wire dangerous_temperature = (temperature_value > MAX_TEMP);
+    wire dangerous_esp         = (esp_fault == 1'b1);
+    wire dangerous_sensor      = (sensor_ok == 1'b0);
+
+    wire warning_voltage     = (voltage_value > WARN_VOLTAGE);
+    wire warning_current     = (current_value > WARN_CURRENT);
+    wire warning_temperature = (temperature_value > WARN_TEMP);
+
+    always @(posedge clk) begin
+        power_uW <= voltage_value * current_value;
+    end
+
+    localparam FSM_IDLE = 2'd0, FSM_MONITOR = 2'd1, FSM_WARNING = 2'd2, FSM_FAULT = 2'd3;
+    reg [1:0] safety_state = FSM_IDLE;
+
+    always @(posedge clk) begin
+        case (state)
+            IDLE: begin
+                baud_counter <= 0; bit_count <= 0;
+                if (rx_sync2 == 1'b0) begin state <= START; baud_counter <= BAUD_DIV / 2; end
+            end
+            START: begin
+                if (baud_counter == 0) begin
+                    if (rx_sync2 == 1'b0) begin state <= DATA; bit_count <= 0; baud_counter <= BAUD_DIV - 1; end
+                    else state <= IDLE;
+                end else baud_counter <= baud_counter - 1'b1;
+            end
+            DATA: begin
+                if (baud_counter == 0) begin
+                    rx_shift[bit_count] <= rx_sync2;
+                    baud_counter <= BAUD_DIV - 1;
+                    if (bit_count == 3'd7) state <= STOP;
+                    else bit_count <= bit_count + 1'b1;
+                end else baud_counter <= baud_counter - 1'b1;
+            end
+            STOP: begin
+                if (baud_counter == 0) begin
+                    if (rx_sync2 == 1'b1) begin
+                        if (rx_shift == "V") {current_field, number_value, reading_number} <= {FIELD_V, 32'd0, 1'b0};
+                        else if (rx_shift == "I") {current_field, number_value, reading_number} <= {FIELD_I, 32'd0, 1'b0};
+                        else if (rx_shift == "T") {current_field, number_value, reading_number} <= {FIELD_T, 32'd0, 1'b0};
+                        else if (rx_shift == "F") {current_field, number_value, reading_number} <= {FIELD_F, 32'd0, 1'b0};
+                        else if (rx_shift == "S") {current_field, number_value, reading_number} <= {FIELD_S, 32'd0, 1'b0};
+                        else if (rx_shift == "=") {number_value, reading_number} <= {32'd0, 1'b1};
+                        else if (rx_shift >= "0" && rx_shift <= "9") begin
+                            if (reading_number) number_value <= (number_value * 10) + (rx_shift - "0");
+                        end
+                        else if (rx_shift == "," || rx_shift == 8'h0A || rx_shift == 8'h0D) begin
+                            if (reading_number) begin
+                                if (current_field == FIELD_V) begin
+                                    if (!voltage_initialized) {voltage_value, previous_voltage, voltage_initialized, voltage_spike} <= {number_value, number_value, 1'b1, 1'b0};
+                                    else {previous_voltage, voltage_value} <= {voltage_value, number_value};
+                                end
+                                else if (current_field == FIELD_I) begin
+                                    if (!current_initialized) {current_value, previous_current, current_initialized, current_surge} <= {number_value, number_value, 1'b1, 1'b0};
+                                    else {previous_current, current_value} <= {current_value, number_value};
+                                end
+                                else if (current_field == FIELD_T) begin
+                                    if (!temperature_initialized) {temperature_value, previous_temperature, temperature_initialized, rapid_temperature_rise} <= {number_value, number_value, 1'b1, 1'b0};
+                                    else {previous_temperature, temperature_value} <= {temperature_value, number_value};
+                                end
+                                else if (current_field == FIELD_F) esp_fault <= (number_value != 0);
+                                else if (current_field == FIELD_S) sensor_ok <= (number_value != 0);
+                                data_received <= 1'b1;
+                            end
+                            {number_value, reading_number} <= {32'd0, 1'b0};
+                        end
+                    end
+                    state <= IDLE; baud_counter <= 0;
+                end else baud_counter <= baud_counter - 1'b1;
+            end
+            default: state <= IDLE;
+        endcase
+
+        case (safety_state)
+            FSM_IDLE: if (data_received) safety_state <= FSM_MONITOR;
+            FSM_MONITOR: begin
+                if (dangerous_voltage || dangerous_current || dangerous_temperature || dangerous_esp || dangerous_sensor) safety_state <= FSM_FAULT;
+                else if (warning_voltage || warning_current || warning_temperature || rapid_temperature_rise || voltage_spike || current_surge) safety_state <= FSM_WARNING;
+            end
+            FSM_WARNING: begin
+                if (dangerous_voltage || dangerous_current || dangerous_temperature || dangerous_esp || dangerous_sensor) safety_state <= FSM_FAULT;
+                else if (!warning_voltage && !warning_current && !warning_temperature) safety_state <= FSM_MONITOR;
+            end
+            FSM_FAULT: begin
+                if (!dangerous_voltage && !dangerous_current && !dangerous_temperature && !dangerous_esp && !dangerous_sensor) begin
+                    if (warning_voltage || warning_current || warning_temperature) safety_state <= FSM_WARNING;
+                    else safety_state <= FSM_MONITOR;
+                end
+            end
+            default: safety_state <= FSM_IDLE;
+        endcase
+    end
+
+    assign led            = (safety_state == FSM_FAULT);
+    assign relay_cutoff   = (safety_state == FSM_FAULT);
+    assign warning_status = (safety_state == FSM_WARNING);
+    assign fault_status   = (safety_state == FSM_FAULT);
+
+endmodule
